@@ -13,6 +13,8 @@ Why I made this?
 ## REQUIREMENTS
 
 - [Zstandard](https://github.com/facebook/zstd) (>= 1.5.5)
+- 64-bit OS
+- **10GB RAM+ (16GB+ recommended)**
 
 ## HOW TO USE
 
@@ -23,21 +25,29 @@ $ curl -X POST http://localhost:8080/rezstd/upload/one   -F "file=@parts.igem.or
 {"task":"task_2023-11-08_211a5d65-4229-4eb2-91bf-3ac68fe45e5e"}
 ```
 
+"task_2023-11-08_211a5d65-4229-4eb2-91bf-3ac68fe45e5e" is the task id.
+
 wait for the task to finish:
 
 ```bash
-$ curl -X GET http://localhost:8080/rezstd/status/task_2023-11-08_211a5d65-4229-4eb2-91bf-3ac68fe45e5e
-{"error":"Task not found"} # HTTP 404, application/json; charset=utf-8
+$ curl -X GET http://localhost:8080/rezstd/status/{task_id}
+{"log-last-line":null,"status":"not found"} # HTTP 404
 or
-{"status":"running"} # HTTP 418, application/json; charset=utf-8
+{"log-last-line":"2023-11-12 03:17:22.13104278 +0800:Pipelines built, starting recompression","status":"running"} # HTTP 418
 or
-...logs... # HTTP 200, text/plain; charset=utf-8
+{"log-last-line":"2023-11-12 03:19:16.59214542 +0800:Task finished, Great!","status":"finished"} # HTTP 200
 ```
 
 then download the re-compressed file:
 
 ```bash
-wget http://localhost:8080/rezstd/download/task_2023-11-08_211a5d65-4229-4eb2-91bf-3ac68fe45e5e/the_file_name_you_want.zst
+wget http://localhost:8080/rezstd/download/{task_id}/the_file_name_you_want.zst
+```
+
+Check the log if you want after the task is created:
+
+```bash
+curl http://localhost:8080/rezstd/log/{task_id}
 ```
 
 ## Configuration

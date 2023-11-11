@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,7 +22,7 @@ const zstdLevel = "-22" // MAX is 22
 type Task string
 
 func (task Task) Log(msg string) {
-	line := fmt.Sprintf("%s:%s", time.Now().Format("2006-01-02 15:04:05 MST"), msg)
+	line := fmt.Sprintf("%s:%s", time.Now().Format("2006-01-02 15:04:05.99999999 -0700"), msg)
 	fmt.Println(task, "|", line)
 	logFilePath := fmt.Sprintf("./www_pub/tasks/%s/%s", task, logFilename)
 	// update the log file if exists
@@ -48,6 +50,17 @@ func (task Task) getLog() string {
 	return string(buf[:n])
 }
 
+func (task Task) getLogLastLine() string {
+	log := task.getLog()
+	lines := strings.Split(log, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i] != "" && lines[i] != "\n" {
+			return lines[i]
+		}
+	}
+	return ""
+}
+
 func main() {
 	r := gin.Default()
 
@@ -56,6 +69,17 @@ func main() {
 		taskName := c.Param("taskname")
 		filePath := fmt.Sprintf("./www_pub/tasks/%s/download/%s", taskName, outputZstdFilename)
 		c.File(filePath)
+	})
+
+	// Handle task log
+	r.GET("/rezstd/log/:task", func(c *gin.Context) {
+		task := Task(c.Param("task"))
+		log := task.getLog()
+		if log == "" {
+			c.String(http.StatusNotFound, "Log not found")
+			return
+		}
+		c.String(http.StatusOK, log)
 	})
 
 	// Handle task status
@@ -67,7 +91,10 @@ func main() {
 		_, err := os.Stat(logFilePath)
 		if os.IsNotExist(err) {
 			c.Status(http.StatusNotFound)
-			c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+			c.JSON(http.StatusNotFound, gin.H{
+				"status":        "not found",
+				"log-last-line": nil,
+			})
 			return
 		}
 
@@ -75,9 +102,15 @@ func main() {
 		if _, err := os.Stat(fmt.Sprintf("./www_pub/tasks/%s/download/%s", task, outputZstdFilename)); err == nil {
 			// finished := true
 			// return the user log file if the task is finished (not json)
-			c.String(http.StatusOK, task.getLog())
+			c.JSON(http.StatusOK, gin.H{
+				"status":        "finished",
+				"log-last-line": task.getLogLastLine(),
+			})
 		} else {
-			c.JSON(http.StatusTeapot, gin.H{"status": "running"})
+			c.JSON(http.StatusTeapot, gin.H{
+				"status":        "running",
+				"log-last-line": task.getLogLastLine(),
+			})
 		}
 
 	})
@@ -113,12 +146,45 @@ func main() {
 	r.Run()
 }
 
+func waitUntilMemAvailable() {
+	// Wait until the system has enough memory
+	var MemAvailableKB uint64
+	for {
+		file, _ := os.Open("/proc/meminfo")
+		buf := make([]byte, 1024*32)
+		n, _ := file.Read(buf)
+		file.Close()
+		lines := strings.Split(string(buf[:n]), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemAvailable:") {
+				fmt.Sscanf(line, "MemAvailable: %d kB", &MemAvailableKB)
+				break
+			}
+		}
+		if MemAvailableKB > 1024*1024*9 {
+			break
+		}
+		print(MemAvailableKB/1024, "MiB available, we need at least 9GiB RAM, waiting...\r")
+		time.Sleep(time.Second * time.Duration(rand.Intn(10)))
+	}
+}
+
 func startTask(task Task) {
 	taskDir := fmt.Sprintf("./www_pub/tasks/%s", task)
 	oriFilePath := fmt.Sprintf("./www_pub/tasks/%s/%s", task, oriZstdFilename)
 
-	// Run zstd to test file size
+	// ori file size
 	task.Log("Testing file integrity and size")
+	fileInfo, err := os.Stat(oriFilePath)
+	if err != nil {
+		task.Log("Failed to get file size")
+		return
+	}
+	oriFileSize := fileInfo.Size()
+	task.Log(fmt.Sprintf("Original file size: %d", oriFileSize))
+
+	waitUntilMemAvailable()
+	// Test the file integrity and get the uncompressed size
 	cmd := exec.Command("zstd", "-d", "--long=31", oriFilePath, "--stdout")
 	stdout_bin, err := cmd.StdoutPipe()
 	if err != nil {
@@ -126,15 +192,16 @@ func startTask(task Task) {
 		return
 	}
 	task.Log("Calculating uncompressed size")
+
 	// calculate the uncompressed size
 	if err := cmd.Start(); err != nil {
 		task.Log("Failed to start zstd")
 		return
 	}
 	var uncompressedSize int64 = 0
+	t_buf := make([]byte, 1024)
 	for {
-		buf := make([]byte, 1024)
-		n, err := stdout_bin.Read(buf)
+		n, err := stdout_bin.Read(t_buf)
 		if err != nil {
 			break
 		}
@@ -148,6 +215,7 @@ func startTask(task Task) {
 	}
 
 	// Recompress the file
+	waitUntilMemAvailable()
 	task.Log("Recompressing the file, building pipelines")
 	tempFilePath := fmt.Sprintf("%s/%s", taskDir, "__temp_running.zst.tmp")
 	dec_cmd := exec.Command("zstd", "-d", "--long=31", oriFilePath, "--stdout")
@@ -171,13 +239,30 @@ func startTask(task Task) {
 		return
 	}
 	task.Log("Pipelines built, starting recompression")
+	last_report := time.Now()
+	pipe_buf := make([]byte, 1024)
+	pipe_transferred := int64(0)
 	for {
-		buf := make([]byte, 1024)
-		n, err := dec_stdout_bin.Read(buf)
+
+		n, err := dec_stdout_bin.Read(pipe_buf)
 		if err != nil {
 			break
 		}
-		com_stdin_bin.Write(buf[:n])
+		com_stdin_bin.Write(pipe_buf[:n])
+		pipe_transferred += int64(n)
+		if time.Since(last_report).Seconds() > 1 {
+			print(11)
+			task.Log(
+				fmt.Sprintf(
+					"Recompression progress: %d/%d (time: %ds, speed: %dMiB/s, %d%%)",
+					pipe_transferred, uncompressedSize,
+					int64(time.Since(last_report).Seconds()),
+					pipe_transferred/1024/1024/int64(time.Since(last_report).Seconds()),
+					pipe_transferred*100/uncompressedSize,
+				),
+			)
+			last_report = time.Now()
+		}
 	}
 	if err := com_stdin_bin.Close(); err != nil {
 		task.Log("Failed to close stdin pipe (compress)")
@@ -198,12 +283,18 @@ func startTask(task Task) {
 	}
 	task.Log("Recompression finished")
 
-	fileInfo, err := os.Stat(tempFilePath)
+	fileInfo, err = os.Stat(tempFilePath)
 	if err != nil {
 		task.Log("Failed to get recompressed file size")
 	}
 	recompressedSize := fileInfo.Size()
-	task.Log(fmt.Sprintf("Recompressed file size: %d", recompressedSize))
+	task.Log(
+		fmt.Sprintf(
+			"Recompressed file size: %d (%2.2f%% of the original zstd file)",
+			recompressedSize,
+			float64(recompressedSize)/float64(oriFileSize)*100,
+		),
+	)
 
 	// Move the recompressed file to the download directory
 	task.Log("Moving the recompressed file to download directory")
